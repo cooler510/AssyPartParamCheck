@@ -62,7 +62,7 @@
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='R4|x64'">
-    <OutDir>C:\Users\zongjingban44\Desktop\AssyPartParamCheck\x64\R4</OutDir>
+    <OutDir>C:\Users\zongjingban44\Desktop\AssyPartParamCheck\x64\R4\</OutDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='R10|x64'" />
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='R4|x64'">

@@ -1,0 +1,716 @@
+#include "InspectionDialog.h"
+
+#include <ProFeatType.h>
+#include <ProMdl.h>
+#include <ProObjects.h>
+#include <ProParameter.h>
+#include <ProParamval.h>
+#include <ProSizeConst.h>
+#include <ProSolid.h>
+#include <ProUtil.h>
+#include <ProWstring.h>
+
+#include <QComboBox>
+#include <QHBoxLayout>
+#include <QHeaderView>
+#include <QMessageBox>
+#include <QStringList>
+#include <string>
+
+namespace
+{
+// 辅助：将 wchar_t 字符串安全复制到 ProName 缓冲区
+void copyToProName(ProName dest, const wchar_t *src)
+{
+    int i = 0;
+    for (; i < PRO_NAME_SIZE - 1 && src[i] != L'\0'; ++i)
+        dest[i] = src[i];
+    dest[i] = L'\0';
+}
+
+// 从模型中读取字符串参数
+bool getParamString(ProMdl mdl, const wchar_t *paramName, QString &out)
+{
+    ProModelitem modelitem;
+    ProError err = ProMdlToModelitem(mdl, &modelitem);
+    if (err != PRO_TK_NO_ERROR)
+        return false;
+
+    ProName wname;
+    copyToProName(wname, paramName);
+
+    ProParameter param;
+    err = ProParameterInit(&modelitem, wname, &param);
+    if (err != PRO_TK_NO_ERROR)
+        return false;
+
+    ProParamvalue value;
+    err = ProParameterValueGet(&param, &value);
+    if (err != PRO_TK_NO_ERROR)
+        return false;
+
+    if (value.type != PRO_PARAM_STRING)
+        return false;
+
+    out = QString::fromWCharArray(value.value.s_val);
+    return true;
+}
+
+// 将字符串参数写回 Creo 模型（参数不存在则自动创建）
+bool setParamString(ProMdl mdl, const wchar_t *paramName, const QString &value)
+{
+    ProModelitem modelitem;
+    ProError err = ProMdlToModelitem(mdl, &modelitem);
+    if (err != PRO_TK_NO_ERROR)
+        return false;
+
+    ProName wname;
+    copyToProName(wname, paramName);
+
+    // 构造 ProParamvalue（ProLine 为 wchar_t 数组）
+    std::wstring ws = value.toStdWString();
+    if (ws.size() >= PRO_LINE_SIZE)
+        ws.resize(PRO_LINE_SIZE - 1);
+
+    ProParamvalue pval;
+    pval.type = PRO_PARAM_STRING;
+    size_t i = 0;
+    for (; i < ws.size(); ++i)
+        pval.value.s_val[i] = ws[i];
+    pval.value.s_val[i] = L'\0';
+
+    ProParameter param;
+    err = ProParameterInit(&modelitem, wname, &param);
+    if (err == PRO_TK_NO_ERROR)
+    {
+        // 已存在：更新值（无单位）
+        err = ProParameterValueWithUnitsSet(&param, &pval, nullptr);
+    }
+    else if (err == PRO_TK_E_NOT_FOUND)
+    {
+        // 不存在：新建参数（无单位）
+        err = ProParameterWithUnitsCreate(&modelitem, wname, &pval, nullptr, &param);
+    }
+
+    return err == PRO_TK_NO_ERROR;
+}
+
+// 判断参数值是否缺失：空字符串或仅含 "/" 都认为缺失
+bool isMissingValue(const QString &s)
+{
+    const QString t = s.trimmed();
+    return t.isEmpty() || t == QStringLiteral("/");
+}
+
+// 获取装配体的直接子组件
+std::vector<ProMdl> getAsmCompModel(ProMdl assem)
+{
+    ProMdlType mdlType;
+    ProMdlTypeGet(assem, &mdlType);
+    if (mdlType != PRO_ASSEMBLY)
+        return {};
+
+    std::vector<ProMdl> result;
+    ProSolidFeatVisit(
+        (ProSolid)assem,
+        [](ProFeature *feature, ProError status, ProAppData data)
+        {
+            ProMdl compModel;
+            status = ProAsmcompMdlGet(feature, &compModel);
+            if (status == PRO_TK_NO_ERROR)
+            {
+                auto arr = (std::vector<ProMdl> *)data;
+                arr->push_back(compModel);
+            }
+            return PRO_TK_NO_ERROR;
+        },
+        [](ProFeature *feature, ProAppData data)
+        {
+            ProFeattype featType;
+            ProError status = ProFeatureTypeGet(feature, &featType);
+            if (status == PRO_TK_NO_ERROR && featType == PRO_FEAT_COMPONENT)
+                return PRO_TK_NO_ERROR;
+            return PRO_TK_CONTINUE;
+        },
+        &result);
+
+    return result;
+}
+
+// 递归获取所有子零件模型
+void getAsmCompModel2(ProMdl assem, std::vector<ProMdl> &allCompModels)
+{
+    auto compModels = getAsmCompModel(assem);
+    for (auto mdl : compModels)
+    {
+        ProMdlType mdlType;
+        ProMdlTypeGet(mdl, &mdlType);
+        if (mdlType == PRO_PART)
+            allCompModels.push_back(mdl);
+        else if (mdlType == PRO_ASSEMBLY)
+        {
+            allCompModels.push_back(mdl);
+            getAsmCompModel2(mdl, allCompModels);
+        }
+    }
+}
+
+// 辅助：Y/N 标记
+QString yn(bool b)
+{
+    return b ? QStringLiteral("Y") : QStringLiteral("N");
+}
+
+// 7 个标识参数名（顺序与未分类表列一致）
+const wchar_t *g_paramNames[7] = {L"SNAME", L"STYPE", L"VENDOR", L"DNAME", L"FINISH", L"MATERIAL", L"QTY"};
+} // namespace
+
+InspectionDialog::InspectionDialog(QWidget *parent)
+    : QDialog(parent)
+{
+    setWindowTitle(QStringLiteral("零件参数缺失检查"));
+    resize(1000, 650);
+
+    m_tabWidget = new QTabWidget(this);
+
+    m_standardTable = new QTableWidget(this);
+    m_standardTable->setColumnCount(4);
+    m_standardTable->setHorizontalHeaderLabels(
+        QStringList() << QStringLiteral("图号")
+                      << QStringLiteral("标准件名称")
+                      << QStringLiteral("型号")
+                      << QStringLiteral("供应商"));
+    setupTable(m_standardTable);
+
+    m_partTable = new QTableWidget(this);
+    m_partTable->setColumnCount(5);
+    m_partTable->setHorizontalHeaderLabels(
+        QStringList() << QStringLiteral("图号")
+                      << QStringLiteral("零件名称")
+                      << QStringLiteral("表面处理")
+                      << QStringLiteral("材料")
+                      << QStringLiteral("零件数量"));
+    setupTable(m_partTable);
+
+    // 未分类页：在一个界面内完成“类型选择 + 7 个参数补全”
+    m_unknownTable = new QTableWidget(this);
+    m_unknownTable->setColumnCount(9);
+    m_unknownTable->setHorizontalHeaderLabels(
+        QStringList() << QStringLiteral("图号")
+                      << QStringLiteral("类型")
+                      << QStringLiteral("标准件名称(SNAME)")
+                      << QStringLiteral("型号(STYPE)")
+                      << QStringLiteral("供应商(VENDOR)")
+                      << QStringLiteral("零件名称(DNAME)")
+                      << QStringLiteral("表面处理(FINISH)")
+                      << QStringLiteral("材料(MATERIAL)")
+                      << QStringLiteral("零件数量(QTY)"));
+    setupTable(m_unknownTable);
+
+    m_tabWidget->addTab(m_standardTable, QStringLiteral("标准件"));
+    m_tabWidget->addTab(m_partTable, QStringLiteral("零件"));
+    m_tabWidget->addTab(m_unknownTable, QStringLiteral("未分类"));
+
+    m_statusLabel = new QLabel(this);
+
+    m_saveBtn = new QPushButton(QStringLiteral("保存修改"), this);
+    connect(m_saveBtn, &QPushButton::clicked, this, &InspectionDialog::saveChanges);
+
+    QPushButton *refreshBtn = new QPushButton(QStringLiteral("刷新"), this);
+    connect(refreshBtn, &QPushButton::clicked, this, [this]()
+            {
+        collectData();
+        refreshTables(); });
+
+    QHBoxLayout *btnLayout = new QHBoxLayout();
+    btnLayout->addWidget(m_saveBtn);
+    btnLayout->addWidget(refreshBtn);
+    btnLayout->addStretch();
+
+    QVBoxLayout *layout = new QVBoxLayout(this);
+    layout->addWidget(m_tabWidget);
+    layout->addWidget(m_statusLabel);
+    layout->addLayout(btnLayout);
+
+    // 编辑后高亮显示变更
+    connect(m_standardTable, &QTableWidget::itemChanged, this, &InspectionDialog::onItemChanged);
+    connect(m_partTable, &QTableWidget::itemChanged, this, &InspectionDialog::onItemChanged);
+
+    collectData();
+    refreshTables();
+}
+
+void InspectionDialog::setupTable(QTableWidget *table)
+{
+    table->setSelectionBehavior(QAbstractItemView::SelectRows);
+    table->setSelectionMode(QAbstractItemView::SingleSelection);
+    table->setEditTriggers(QAbstractItemView::DoubleClicked | QAbstractItemView::EditKeyPressed);
+    table->verticalHeader()->setVisible(false);
+    table->horizontalHeader()->setStretchLastSection(true);
+    table->setAlternatingRowColors(true);
+}
+
+void InspectionDialog::onItemChanged(QTableWidgetItem *item)
+{
+    if (!item)
+        return;
+
+    QString original = item->data(Qt::UserRole).toString();
+    if (item->text() != original)
+        item->setBackground(QBrush(QColor(255, 255, 192))); // 浅黄色：已修改未保存
+    else
+        item->setBackground(QBrush(Qt::white));
+}
+
+void InspectionDialog::collectData()
+{
+    m_standardParts.clear();
+    m_parts.clear();
+    m_unknownParts.clear();
+    m_debugText.clear();
+
+    ProMdl mdl;
+    if (ProMdlCurrentGet(&mdl) != PRO_TK_NO_ERROR)
+    {
+        m_debugText += QStringLiteral("[ERROR] ProMdlCurrentGet failed\n");
+        return;
+    }
+
+    ProMdlType type;
+    if (ProMdlTypeGet(mdl, &type) != PRO_TK_NO_ERROR)
+    {
+        m_debugText += QStringLiteral("[ERROR] ProMdlTypeGet failed\n");
+        return;
+    }
+
+    // 显示当前模型信息
+    wchar_t curName[PRO_PATH_SIZE] = {0};
+    ProMdlNameGet(mdl, curName);
+    QString curNameStr = QString::fromWCharArray(curName);
+
+    m_debugText += QStringLiteral("=== current model ===\n");
+    m_debugText += QStringLiteral("name: %1\n").arg(curNameStr);
+    QString typeStr;
+    if (type == PRO_ASSEMBLY)
+        typeStr = QStringLiteral("PRO_ASSEMBLY (OK)");
+    else if (type == PRO_PART)
+        typeStr = QStringLiteral("PRO_PART (need ASM)");
+    else
+        typeStr = QStringLiteral("other type");
+    m_debugText += QStringLiteral("type: %1\n\n").arg(typeStr);
+
+    if (type != PRO_ASSEMBLY)
+    {
+        m_debugText += QStringLiteral("[ERROR] current model is not ASM\n");
+        return;
+    }
+
+    std::vector<ProMdl> allModels;
+    getAsmCompModel2(mdl, allModels);
+
+    int totalPrt = 0;
+    int stdBranch = 0;
+    int partBranch = 0;
+    int stdMissing = 0;
+    int partMissing = 0;
+    int unknownCount = 0;
+
+    m_debugText += QStringLiteral("=== traverse result ===\n");
+    m_debugText += QStringLiteral("total models (incl sub-asm): %1\n\n").arg(allModels.size());
+
+    for (auto m : allModels)
+    {
+        ProMdlType mType;
+        if (ProMdlTypeGet(m, &mType) != PRO_TK_NO_ERROR || mType != PRO_PART)
+            continue;
+
+        totalPrt++;
+
+        // 获取文件名
+        wchar_t fileName[PRO_PATH_SIZE] = {0};
+        if (ProMdlNameGet(m, fileName) != PRO_TK_NO_ERROR)
+            continue;
+        QString fn = QString::fromWCharArray(fileName);
+        if (!fn.endsWith(QStringLiteral(".prt"), Qt::CaseInsensitive))
+            fn += QStringLiteral(".prt");
+
+        // 读取标准件参数
+        QString sname, stype, vendor;
+        bool hasSname = getParamString(m, L"SNAME", sname);
+        bool hasStype = getParamString(m, L"STYPE", stype);
+        bool hasVendor = getParamString(m, L"VENDOR", vendor);
+
+        // 读取普通零件参数
+        QString dname, finish, material, qty;
+        bool hasDname = getParamString(m, L"DNAME", dname);
+        bool hasFinish = getParamString(m, L"FINISH", finish);
+        bool hasMaterial = getParamString(m, L"MATERIAL", material);
+        bool hasQty = getParamString(m, L"QTY", qty);
+
+        m_debugText += QStringLiteral("[%1] %2\n").arg(totalPrt).arg(fn);
+        m_debugText += QStringLiteral("  SNAME:    has=%1  value=\"%2\"  missing=%3\n")
+                           .arg(yn(hasSname))
+                           .arg(sname)
+                           .arg(yn(isMissingValue(sname)));
+        m_debugText += QStringLiteral("  STYPE:    has=%1  value=\"%2\"  missing=%3\n")
+                           .arg(yn(hasStype))
+                           .arg(stype)
+                           .arg(yn(isMissingValue(stype)));
+        m_debugText += QStringLiteral("  VENDOR:   has=%1  value=\"%2\"  missing=%3\n")
+                           .arg(yn(hasVendor))
+                           .arg(vendor)
+                           .arg(yn(isMissingValue(vendor)));
+        m_debugText += QStringLiteral("  DNAME:    has=%1  value=\"%2\"  missing=%3\n")
+                           .arg(yn(hasDname))
+                           .arg(dname)
+                           .arg(yn(isMissingValue(dname)));
+        m_debugText += QStringLiteral("  FINISH:   has=%1  value=\"%2\"  missing=%3\n")
+                           .arg(yn(hasFinish))
+                           .arg(finish)
+                           .arg(yn(isMissingValue(finish)));
+        m_debugText += QStringLiteral("  MATERIAL: has=%1  value=\"%2\"  missing=%3\n")
+                           .arg(yn(hasMaterial))
+                           .arg(material)
+                           .arg(yn(isMissingValue(material)));
+        m_debugText += QStringLiteral("  QTY:      has=%1  value=\"%2\"  missing=%3\n")
+                           .arg(yn(hasQty))
+                           .arg(qty)
+                           .arg(yn(isMissingValue(qty)));
+
+        // 分类依据：只要某个类别的字段中任一值非空，就归属到该类别；
+        // 全部字段为空（参数被删除或值被清空）则回到未分类。
+        bool hasAnyStd = !isMissingValue(sname) || !isMissingValue(stype) || !isMissingValue(vendor);
+        bool hasAnyPart = !isMissingValue(dname) || !isMissingValue(finish) || !isMissingValue(material) || !isMissingValue(qty);
+
+        // 未分类：7 个标识参数全部不存在
+        if (!hasAnyStd && !hasAnyPart)
+        {
+            unknownCount++;
+            m_debugText += QStringLiteral("  -> result: UNKNOWN, added to unknown table\n");
+            UnknownPartInfo info;
+            info.mdl = m;
+            info.fileName = fn;
+            // 未分类页改为直接填写参数，不再显示纯文本建议
+            m_unknownParts.push_back(info);
+        }
+        // 存在标准件相关参数（SNAME/STYPE/VENDOR 任一）
+        else if (hasAnyStd)
+        {
+            stdBranch++;
+            m_debugText += QStringLiteral("  -> branch: standard\n");
+            if (isMissingValue(sname) || isMissingValue(stype) || isMissingValue(vendor))
+            {
+                stdMissing++;
+                m_debugText += QStringLiteral("  -> result: MISSING, added to std table\n");
+                StandardPartInfo info;
+                info.mdl = m;
+                info.fileName = fn;
+                info.sname = sname;
+                info.stype = stype;
+                info.vendor = vendor;
+                m_standardParts.push_back(info);
+            }
+            else
+            {
+                m_debugText += QStringLiteral("  -> result: OK, skipped\n");
+            }
+        }
+        // 存在普通零件相关参数（DNAME/FINISH/MATERIAL/QTY 任一）
+        else if (hasAnyPart)
+        {
+            partBranch++;
+            m_debugText += QStringLiteral("  -> branch: part\n");
+            if (isMissingValue(dname) || isMissingValue(finish) || isMissingValue(material) || isMissingValue(qty))
+            {
+                partMissing++;
+                m_debugText += QStringLiteral("  -> result: MISSING, added to part table\n");
+                PartInfo info;
+                info.mdl = m;
+                info.fileName = fn;
+                info.dname = dname;
+                info.finish = finish;
+                info.material = material;
+                info.qty = qty;
+                m_parts.push_back(info);
+            }
+            else
+            {
+                m_debugText += QStringLiteral("  -> result: OK, skipped\n");
+            }
+        }
+        m_debugText += QStringLiteral("\n");
+    }
+
+    m_debugText += QStringLiteral("=== summary ===\n");
+    m_debugText += QStringLiteral("total PRT: %1\n").arg(totalPrt);
+    m_debugText += QStringLiteral("std branch: %1 (missing %2)\n").arg(stdBranch).arg(stdMissing);
+    m_debugText += QStringLiteral("part branch: %1 (missing %2)\n").arg(partBranch).arg(partMissing);
+    m_debugText += QStringLiteral("unknown: %1\n").arg(unknownCount);
+
+    m_statusLabel->setText(
+        QStringLiteral("PRT: %1 | 标准件: %2(缺失 %3) | 零件: %4(缺失 %5) | 未分类: %6")
+            .arg(totalPrt)
+            .arg(stdBranch)
+            .arg(stdMissing)
+            .arg(partBranch)
+            .arg(partMissing)
+            .arg(unknownCount));
+}
+
+void InspectionDialog::refreshTables()
+{
+    // 标准件表
+    m_standardTable->blockSignals(true);
+    m_standardTable->setRowCount(static_cast<int>(m_standardParts.size()));
+    for (int i = 0; i < static_cast<int>(m_standardParts.size()); ++i)
+    {
+        const auto &info = m_standardParts[i];
+
+        QTableWidgetItem *fileItem = new QTableWidgetItem(info.fileName);
+        fileItem->setFlags(fileItem->flags() & ~Qt::ItemIsEditable);
+        fileItem->setData(Qt::UserRole, info.fileName);
+        m_standardTable->setItem(i, 0, fileItem);
+
+        QTableWidgetItem *snameItem = new QTableWidgetItem(info.sname);
+        snameItem->setFlags(snameItem->flags() | Qt::ItemIsEditable);
+        snameItem->setData(Qt::UserRole, info.sname);
+        m_standardTable->setItem(i, 1, snameItem);
+
+        QTableWidgetItem *stypeItem = new QTableWidgetItem(info.stype);
+        stypeItem->setFlags(stypeItem->flags() | Qt::ItemIsEditable);
+        stypeItem->setData(Qt::UserRole, info.stype);
+        m_standardTable->setItem(i, 2, stypeItem);
+
+        QTableWidgetItem *vendorItem = new QTableWidgetItem(info.vendor);
+        vendorItem->setFlags(vendorItem->flags() | Qt::ItemIsEditable);
+        vendorItem->setData(Qt::UserRole, info.vendor);
+        m_standardTable->setItem(i, 3, vendorItem);
+    }
+    m_standardTable->blockSignals(false);
+
+    // 普通零件表
+    m_partTable->blockSignals(true);
+    m_partTable->setRowCount(static_cast<int>(m_parts.size()));
+    for (int i = 0; i < static_cast<int>(m_parts.size()); ++i)
+    {
+        const auto &info = m_parts[i];
+
+        QTableWidgetItem *fileItem = new QTableWidgetItem(info.fileName);
+        fileItem->setFlags(fileItem->flags() & ~Qt::ItemIsEditable);
+        fileItem->setData(Qt::UserRole, info.fileName);
+        m_partTable->setItem(i, 0, fileItem);
+
+        QTableWidgetItem *dnameItem = new QTableWidgetItem(info.dname);
+        dnameItem->setFlags(dnameItem->flags() | Qt::ItemIsEditable);
+        dnameItem->setData(Qt::UserRole, info.dname);
+        m_partTable->setItem(i, 1, dnameItem);
+
+        QTableWidgetItem *finishItem = new QTableWidgetItem(info.finish);
+        finishItem->setFlags(finishItem->flags() | Qt::ItemIsEditable);
+        finishItem->setData(Qt::UserRole, info.finish);
+        m_partTable->setItem(i, 2, finishItem);
+
+        QTableWidgetItem *materialItem = new QTableWidgetItem(info.material);
+        materialItem->setFlags(materialItem->flags() | Qt::ItemIsEditable);
+        materialItem->setData(Qt::UserRole, info.material);
+        m_partTable->setItem(i, 3, materialItem);
+
+        QTableWidgetItem *qtyItem = new QTableWidgetItem(info.qty);
+        qtyItem->setFlags(qtyItem->flags() | Qt::ItemIsEditable);
+        qtyItem->setData(Qt::UserRole, info.qty);
+        m_partTable->setItem(i, 4, qtyItem);
+    }
+    m_partTable->blockSignals(false);
+
+    // 未分类表：图号 + 类型下拉 + 7 个参数输入框
+    m_unknownTable->blockSignals(true);
+    m_unknownTable->setRowCount(static_cast<int>(m_unknownParts.size()));
+    for (int i = 0; i < static_cast<int>(m_unknownParts.size()); ++i)
+    {
+        const auto &info = m_unknownParts[i];
+
+        QTableWidgetItem *fileItem = new QTableWidgetItem(info.fileName);
+        fileItem->setFlags(fileItem->flags() & ~Qt::ItemIsEditable);
+        fileItem->setData(Qt::UserRole, info.fileName);
+        m_unknownTable->setItem(i, 0, fileItem);
+
+        // 类型选择：标准件 / 零件，每行独立（不联动其他行、不切换全局视图）
+        QComboBox *typeCombo = new QComboBox(this);
+        typeCombo->addItems(QStringList() << QStringLiteral("标准件") << QStringLiteral("零件"));
+        typeCombo->setCurrentIndex(info.chosenType);
+        connect(typeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+                this, [this, i](int idx)
+                {
+                    if (i >= 0 && i < static_cast<int>(m_unknownParts.size()))
+                        m_unknownParts[i].chosenType = idx;
+                });
+        m_unknownTable->setCellWidget(i, 1, typeCombo);
+
+        // 7 个参数输入列（2~8）：SNAME / STYPE / VENDOR / DNAME / FINISH / MATERIAL / QTY
+        for (int c = 0; c < 7; ++c)
+        {
+            QTableWidgetItem *paramItem = new QTableWidgetItem(QString());
+            paramItem->setFlags(paramItem->flags() | Qt::ItemIsEditable);
+            m_unknownTable->setItem(i, 2 + c, paramItem);
+        }
+    }
+    applyUnknownColumnView();
+    m_unknownTable->blockSignals(false);
+}
+
+void InspectionDialog::saveChanges()
+{
+    int changedCount = 0;
+    int errorCount = 0;
+    QStringList errorList;
+
+    auto applyIfChanged = [&](ProMdl mdl, const wchar_t *paramName,
+                              const QString &newVal, QString &storedVal) -> int
+    {
+        if (newVal == storedVal)
+            return 0; // 无变化
+        if (setParamString(mdl, paramName, newVal))
+        {
+            storedVal = newVal;
+            return 1; // 修改成功
+        }
+        return -1; // 修改失败
+    };
+
+    // 保存标准件修改
+    for (int i = 0; i < static_cast<int>(m_standardParts.size()); ++i)
+    {
+        StandardPartInfo &info = m_standardParts[i];
+        QString newSname = m_standardTable->item(i, 1)->text();
+        QString newStype = m_standardTable->item(i, 2)->text();
+        QString newVendor = m_standardTable->item(i, 3)->text();
+
+        int r;
+        r = applyIfChanged(info.mdl, L"SNAME", newSname, info.sname);
+        if (r == 1)
+            changedCount++;
+        else if (r == -1)
+        {
+            errorCount++;
+            errorList << QStringLiteral("%1:SNAME").arg(info.fileName);
+        }
+
+        r = applyIfChanged(info.mdl, L"STYPE", newStype, info.stype);
+        if (r == 1)
+            changedCount++;
+        else if (r == -1)
+        {
+            errorCount++;
+            errorList << QStringLiteral("%1:STYPE").arg(info.fileName);
+        }
+
+        r = applyIfChanged(info.mdl, L"VENDOR", newVendor, info.vendor);
+        if (r == 1)
+            changedCount++;
+        else if (r == -1)
+        {
+            errorCount++;
+            errorList << QStringLiteral("%1:VENDOR").arg(info.fileName);
+        }
+    }
+
+    // 保存普通零件修改
+    for (int i = 0; i < static_cast<int>(m_parts.size()); ++i)
+    {
+        PartInfo &info = m_parts[i];
+        QString newDname = m_partTable->item(i, 1)->text();
+        QString newFinish = m_partTable->item(i, 2)->text();
+        QString newMaterial = m_partTable->item(i, 3)->text();
+        QString newQty = m_partTable->item(i, 4)->text();
+
+        int r;
+        r = applyIfChanged(info.mdl, L"DNAME", newDname, info.dname);
+        if (r == 1)
+            changedCount++;
+        else if (r == -1)
+        {
+            errorCount++;
+            errorList << QStringLiteral("%1:DNAME").arg(info.fileName);
+        }
+
+        r = applyIfChanged(info.mdl, L"FINISH", newFinish, info.finish);
+        if (r == 1)
+            changedCount++;
+        else if (r == -1)
+        {
+            errorCount++;
+            errorList << QStringLiteral("%1:FINISH").arg(info.fileName);
+        }
+
+        r = applyIfChanged(info.mdl, L"MATERIAL", newMaterial, info.material);
+        if (r == 1)
+            changedCount++;
+        else if (r == -1)
+        {
+            errorCount++;
+            errorList << QStringLiteral("%1:MATERIAL").arg(info.fileName);
+        }
+
+        r = applyIfChanged(info.mdl, L"QTY", newQty, info.qty);
+        if (r == 1)
+            changedCount++;
+        else if (r == -1)
+        {
+            errorCount++;
+            errorList << QStringLiteral("%1:QTY").arg(info.fileName);
+        }
+    }
+
+    // 保存未分类零件：将用户填写的参数写回 Creo，再由 collectData 重新归类。
+    // 每行按自己选择的类型回写对应字段（标准件：SNAME/STYPE/VENDOR；零件：DNAME/FINISH/MATERIAL/QTY），
+    // 不串味。只填写其中 1~2 个参数的零件，保存后会进入对应的“标准件/零件”页并显示仍缺失的参数。
+    for (int i = 0; i < static_cast<int>(m_unknownParts.size()); ++i)
+    {
+        const UnknownPartInfo &info = m_unknownParts[i];
+        int type = info.chosenType;                         // 0=标准件, 1=零件（每行独立）
+        int startCol = (type == 0) ? 0 : 3;                 // 标准件写第 0~2 列，零件写第 3~6 列
+        int endCol = (type == 0) ? 3 : 7;
+        for (int c = startCol; c < endCol; ++c)
+        {
+            QTableWidgetItem *item = m_unknownTable->item(i, 2 + c);
+            QString val = item ? item->text().trimmed() : QString();
+            if (val.isEmpty())
+                continue;
+            if (setParamString(info.mdl, g_paramNames[c], val))
+                changedCount++;
+            else
+            {
+                errorCount++;
+                errorList << QStringLiteral("%1:%2").arg(info.fileName).arg(QString::fromWCharArray(g_paramNames[c]));
+            }
+        }
+    }
+
+    // 重新收集数据并刷新表格：已补全的零件会按类型进入对应页面，未填全的仍显示缺失项
+    collectData();
+    refreshTables();
+
+    QString msg = QStringLiteral("保存完成：%1 个字段更新成功").arg(changedCount);
+    if (errorCount > 0)
+        msg += QStringLiteral("，%1 个失败").arg(errorCount);
+    if (!errorList.isEmpty())
+        msg += QStringLiteral("\n失败项：%1").arg(errorList.join(", "));
+
+    m_statusLabel->setText(msg);
+
+    if (errorCount > 0)
+    {
+        QMessageBox::warning(this, QStringLiteral("保存结果"),
+                             QStringLiteral("%1 个字段保存失败：%2").arg(errorCount).arg(errorList.join(", ")));
+    }
+}
+
+void InspectionDialog::applyUnknownColumnView()
+{
+    // 未分类页支持每行独立选择类型（标准件/零件），而 QTableWidget 的列是全局的，
+    // 无法做到“不同行显示不同列”，因此这里始终显示全部 9 列，由每行各自的类型决定填写哪些参数。
+    for (int c = 0; c < m_unknownTable->columnCount(); ++c)
+        m_unknownTable->setColumnHidden(c, false);
+
+    m_unknownTable->horizontalHeader()->setStretchLastSection(true);
+}
