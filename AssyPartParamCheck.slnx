@@ -1,0 +1,8 @@
+<Solution>
+  <Configurations>
+    <BuildType Name="R10" />
+    <BuildType Name="R4" />
+    <Platform Name="x64" />
+  </Configurations>
+  <Project Path="AssyPartParamCheck/AssyPartParamCheck.vcxproj" Id="81f54bb5-3452-43b9-9a8e-561a28b0cb9d" />
+</Solution>

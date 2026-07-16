@@ -1,0 +1,14 @@
+﻿PopupTest
+检查
+检查
+#
+
+PartInspectionLabel
+检查零件参数
+检查零件参数
+#
+
+PartInspectionTips
+检查装配体中标准件和普通零件的参数完整性
+检查装配体中标准件和普通零件的参数完整性
+#
