@@ -1,6 +1,6 @@
 ﻿NAME               Assy Part Param Check
 EXEC_FILE          C:\Users\zongjingban44\Desktop\AssyPartParamCheck\x64\R4\AssyPartParamCheck.dll
-TEXT_DIR          C:\Users\zongjingban44\Desktop\AssyPartParamCheck\AssyPartParamCheck
+TEXT_DIR          C:\Users\zongjingban44\Desktop\AssyPartParamCheck\AssyPartParamCheck\text
 STARTUP          dll
 allow_stop        true
 delay_start        false

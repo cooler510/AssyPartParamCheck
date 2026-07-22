@@ -12,7 +12,7 @@
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <ProjectGuid>{81f54bb5-3452-43b9-9a8e-561a28b0cb9d}</ProjectGuid>
-    <TargetName>AssyPartParamCheck</TargetName>
+    <TargetName>$(MSBuildProjectName)</TargetName>
     <Keyword>QtVS_v304</Keyword>
     <WindowsTargetPlatformVersion Condition="'$(Configuration)|$(Platform)'=='R4|x64'">8.1</WindowsTargetPlatformVersion>
     <WindowsTargetPlatformVersion Condition="'$(Configuration)|$(Platform)'=='R10|x64'">10.0</WindowsTargetPlatformVersion>
@@ -62,7 +62,7 @@
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='R4|x64'">
-    <OutDir>C:\Users\zongjingban44\Desktop\AssyPartParamCheck\x64\R4\</OutDir>
+    <OutDir>$(OutDir)</OutDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='R10|x64'" />
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='R4|x64'">
@@ -74,6 +74,8 @@
     <Link>
       <AdditionalLibraryDirectories>$(CREO4_BASE_DIR)\protoolkit\x86e_win64\obj;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>netapi32.lib;psapi.lib;mpr.lib;wsock32.lib;protk_dll_NU.lib;protk_dllmd_NU.lib;protkmd_NU.lib;protoolkit_NU.lib;pt_asynchronous.lib;ptasyncmd.lib;ucore.lib;udata.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <DelayLoadDLLs>
+      </DelayLoadDLLs>
     </Link>
     <PostBuildEvent>
       <Command>
